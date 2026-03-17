@@ -58,13 +58,62 @@ class DQNReplayBuffer:
 
 
 # ===========================================================================
+# Reward normalizer (running mean/std)
+# ===========================================================================
+
+class RewardNormalizer:
+    """Normalizes rewards using a running mean and standard deviation.
+
+    This makes the DQN equally sensitive to all reward magnitudes,
+    preventing large kill rewards (+10) from drowning out small
+    shaping signals (-0.01 to -0.5) in the gradient.
+
+    Uses Welford's online algorithm for numerical stability.
+    """
+
+    def __init__(self, clip: float = 5.0):
+        self.clip = clip
+        self.count: int = 0
+        self.mean: float = 0.0
+        self._m2: float = 0.0  # sum of squared deviations
+
+    @property
+    def std(self) -> float:
+        if self.count < 2:
+            return 1.0
+        return max(math.sqrt(self._m2 / self.count), 1e-6)
+
+    def normalize(self, reward: float) -> float:
+        """Update running stats and return normalized reward."""
+        # Welford's online update
+        self.count += 1
+        delta = reward - self.mean
+        self.mean += delta / self.count
+        delta2 = reward - self.mean
+        self._m2 += delta * delta2
+
+        # Normalize and clip
+        normed = (reward - self.mean) / self.std
+        return max(-self.clip, min(self.clip, normed))
+
+    def get_state(self) -> dict:
+        return {"count": self.count, "mean": self.mean, "m2": self._m2}
+
+    def load_state(self, state: dict) -> None:
+        self.count = state.get("count", 0)
+        self.mean = state.get("mean", 0.0)
+        self._m2 = state.get("m2", 0.0)
+
+
+# ===========================================================================
 # DQN Agent
 # ===========================================================================
 
 class DQNAgent:
-    """Double DQN agent with target network and experience replay.
+    """Double DQN agent with target network, experience replay,
+    and reward normalization.
 
-    Runs entirely on CPU -- fast enough for this game (~10K params).
+    Runs entirely on CPU -- fast enough for this game (~30K params).
     """
 
     def __init__(self, agent_id: int):
@@ -97,6 +146,9 @@ class DQNAgent:
         self.replay_buffer = DQNReplayBuffer(
             capacity=getattr(cfg, 'REPLAY_CAPACITY', 50000))
 
+        # Reward normalization
+        self.reward_normalizer = RewardNormalizer(clip=5.0)
+
         self._step_count = 0
 
     # ------------------------------------------------------------------
@@ -114,8 +166,9 @@ class DQNAgent:
     def learn(self, state: list[float], action: int,
               reward: float, next_state: list[float],
               done: bool = False) -> None:
-        """Store transition and perform training step(s)."""
-        self.replay_buffer.push(state, action, reward, next_state, done)
+        """Store transition with normalized reward and train."""
+        norm_reward = self.reward_normalizer.normalize(reward)
+        self.replay_buffer.push(state, action, norm_reward, next_state, done)
         self._step_count += 1
 
         if len(self.replay_buffer) < self.min_replay:
@@ -200,6 +253,7 @@ class DQNAgent:
             "num_actions": self.num_actions,
             "epsilon": self.epsilon,
             "episode": episode,
+            "reward_normalizer": self.reward_normalizer.get_state(),
         }, path)
 
     def load(self, path: str) -> dict:
@@ -219,7 +273,46 @@ class DQNAgent:
         self._step_count = checkpoint.get("step_count", 0)
         saved_eps = checkpoint.get("epsilon", self.epsilon)
         self.epsilon = saved_eps
+        # Restore reward normalizer state
+        rn_state = checkpoint.get("reward_normalizer", None)
+        if rn_state:
+            self.reward_normalizer.load_state(rn_state)
         return {"epsilon": saved_eps, "episode": checkpoint.get("episode", 0)}
+
+    # ------------------------------------------------------------------
+    # Population-Based Training support
+    # ------------------------------------------------------------------
+    def clone_from(self, other: DQNAgent, noise_std: float = 0.0) -> None:
+        """Copy weights from *other* agent, optionally adding Gaussian noise.
+
+        Used by PBT: clone a top-performer's network into a weak agent,
+        then mutate slightly so the population stays diverse.
+        """
+        self.policy_net.load_state_dict(other.policy_net.state_dict())
+        self.target_net.load_state_dict(other.target_net.state_dict())
+        # Copy optimizer momentum state
+        self.optimizer.load_state_dict(other.optimizer.state_dict())
+        self._step_count = other._step_count
+
+        if noise_std > 0:
+            with torch.no_grad():
+                for param in self.policy_net.parameters():
+                    param.add_(torch.randn_like(param) * noise_std)
+            # Sync target after mutation
+            self.target_net.load_state_dict(self.policy_net.state_dict())
+
+    def mutate_hyperparameters(self,
+                               lr_range: tuple[float, float] = (0.5, 2.0),
+                               eps_range: tuple[float, float] = (0.8, 1.0)) -> None:
+        """Randomly perturb learning rate and epsilon for PBT diversity."""
+        import random as _rnd
+        lr_mult = _rnd.uniform(*lr_range)
+        eps_mult = _rnd.uniform(*eps_range)
+        new_lr = max(1e-5, min(self.lr * lr_mult, 0.01))
+        self.lr = new_lr
+        for pg in self.optimizer.param_groups:
+            pg['lr'] = new_lr
+        self.epsilon = max(self.epsilon_min, self.epsilon * eps_mult)
 
     # ------------------------------------------------------------------
     # Compatibility properties (so main.py can work with both agent types)

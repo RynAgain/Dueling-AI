@@ -22,7 +22,7 @@ TANK_HP = 3  # hit points per tank
 BULLET_RADIUS = 4
 BULLET_SPEED = 6.0
 BULLET_LIFETIME = 180  # ticks
-BULLET_MAX_BOUNCES = 1  # ricochet off arena walls
+BULLET_MAX_BOUNCES = 0  # 0 = no ricochet (direct-line only, fully learnable)
 
 # Wall
 WALL_SIZE = 40
@@ -46,8 +46,8 @@ MINE_DAMAGE = 1
 # Scoring
 POINTS_TO_WIN = 3
 ROUND_TIMEOUT = 1000  # ticks (~17s at 60 FPS -- faster resolution)
-SHRINK_START_RATIO = 0.6  # start pushing tanks toward center at 60% of timeout
-SHRINK_FORCE = 0.3        # pixels/tick push toward center during shrink phase
+SHRINK_START_RATIO = 0.0  # start pushing tanks toward center at 60% of timeout
+SHRINK_FORCE = 0.0        # pixels/tick push toward center during shrink phase
 MAX_ROUNDS_PER_EPISODE = 10  # safety cap to prevent infinite episodes
 
 # Q-Learning hyperparameters
@@ -69,11 +69,11 @@ REWARD_GOT_HIT = -10.0     # only on kill
 REWARD_DAMAGE = 5.0         # dealing 1 HP damage (not kill)
 REWARD_TOOK_DAMAGE = -5.0   # taking 1 HP damage (not kill)
 REWARD_WALL_DESTROY = 0.5
-REWARD_MISSED_SHOT = -0.2
+REWARD_MISSED_SHOT = -0.5
+REWARD_DIRECT_HIT_BONUS = 0.0  # disabled: all hits are direct (no ricochet)
 REWARD_TIMESTEP = -0.01
 REWARD_CLOSER = 0.05
 REWARD_MINE_HIT = 5.0       # mine you placed hit the enemy
-REWARD_MINE_SELF = -5.0     # (legacy -- mines no longer hurt owner)
 REWARD_MOVEMENT = 0.02      # per-tick bonus when tank has moved from spawn
 MOVEMENT_REWARD_DIST = 50   # minimum distance from spawn to earn movement reward
 MOVEMENT_REWARD_CAP = 200   # distance beyond which movement reward doesn't increase
@@ -109,7 +109,7 @@ REPLAY_EPISODE_BURST = 128   # large replay burst at end of each episode
 PER_ALPHA = 0.6              # prioritisation exponent (0=uniform, 1=full priority)
 
 # DQN hyperparameters (used when --dqn flag is passed)
-DQN_STATE_DIM = 21           # continuous state vector size (from state_encoder_continuous)
+DQN_STATE_DIM = 63           # stacked state: 21 floats x 3 frames (from state_encoder_continuous)
 DQN_LR = 3e-3               # Adam learning rate (aggressive -- small network trains fast)
 DQN_BATCH_SIZE = 128         # mini-batch size for DQN training
 DQN_TARGET_UPDATE = 300      # steps between target network updates (faster sync)
@@ -121,6 +121,15 @@ DQN_GRAD_STEPS = 2           # gradient updates per train step
 # Expert opponent mixing (during DQN training)
 EXPERT_MIX_RATIO = 0.25     # 25% of training episodes use expert as opponent
 
+# Population-Based Training (PBT)
+PBT_POPULATION_SIZE = 6      # number of agents in the population
+PBT_GENERATION_EPISODES = 50 # episodes per generation before selection
+PBT_MATCHES_PER_PAIR = 3     # round-robin matches between each pair
+PBT_ELITE_RATIO = 0.33       # top 33% survive unchanged
+PBT_MUTATE_LR_RANGE = (0.5, 2.0)    # multiply LR by uniform(low, high)
+PBT_MUTATE_EPSILON_RANGE = (0.8, 1.0)  # multiply epsilon by uniform(low, high)
+PBT_WEIGHT_NOISE_STD = 0.01  # std of Gaussian noise added to cloned weights
+
 # Curriculum learning (5 phases -- gradually introduce features)
 CURRICULUM_PHASE_1_END = 200   # episodes 1-200:   no walls, no power-ups, no mines
 CURRICULUM_PHASE_2_END = 500   # episodes 201-500: few walls (4), no power-ups, no mines
@@ -129,7 +138,8 @@ CURRICULUM_PHASE_4_END = 1200  # episodes 801-1200: full walls, power-ups, mines
 # episodes 1201+: everything enabled (full game)
 
 # Rendering
-FPS = 600
+FPS = 60
+TRAINING_FPS = 600  # uncapped when rendering during training
 SCREEN_WIDTH = ARENA_WIDTH
 SCREEN_HEIGHT = ARENA_HEIGHT + HUD_HEIGHT
 
@@ -139,7 +149,6 @@ MOVE_BACKWARD = 1
 MOVE_ROTATE_LEFT = 2
 MOVE_ROTATE_RIGHT = 3
 MOVE_NOOP = 4
-NUM_MOVE_ACTIONS = 5  # kept for legacy reference
 
 # Turret sub-actions (0-2)
 TURRET_LEFT = 0
@@ -150,3 +159,22 @@ TURRET_NOOP = 2
 FIRE_NONE = 0
 FIRE_SHOOT = 1
 FIRE_MINE = 2
+
+
+# ---------------------------------------------------------------------------
+# Action encoding / decoding helpers
+# ---------------------------------------------------------------------------
+
+def encode_action(move: int, turret: int, fire: int) -> int:
+    """Encode sub-actions into a single composite action index."""
+    return move * (NUM_TURRET_OPTIONS * NUM_FIRE_OPTIONS) + \
+           turret * NUM_FIRE_OPTIONS + fire
+
+
+def decode_action(action: int) -> tuple[int, int, int]:
+    """Decode composite action into (move, turret, fire) sub-actions."""
+    fire = action % NUM_FIRE_OPTIONS
+    remaining = action // NUM_FIRE_OPTIONS
+    turret = remaining % NUM_TURRET_OPTIONS
+    move = remaining // NUM_TURRET_OPTIONS
+    return move, turret, fire

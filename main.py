@@ -9,95 +9,9 @@ import time
 import random
 import pygame
 import config as cfg
-from game.game_manager import GameManager, EVT_HIT, EVT_DAMAGE, EVT_WALL_DESTROY, \
-    EVT_BULLET_EXPIRE, EVT_ROUND_OVER, EVT_ROUND_WINNER, EVT_MINE_HIT, EVT_DODGE
+from game.game_manager import GameManager, EVT_ROUND_OVER
+from ai.reward import compute_reward
 from rendering.renderer import Renderer
-
-
-# ===========================================================================
-# Reward computation (inline -- keeps things self-contained)
-# ===========================================================================
-
-# Cache config values as module-level locals for speed in the hot path
-_R_TIMESTEP = cfg.REWARD_TIMESTEP
-_R_HIT_ENEMY = cfg.REWARD_HIT_ENEMY
-_R_GOT_HIT = cfg.REWARD_GOT_HIT
-_R_DAMAGE = cfg.REWARD_DAMAGE
-_R_TOOK_DAMAGE = cfg.REWARD_TOOK_DAMAGE
-_R_WALL_DESTROY = cfg.REWARD_WALL_DESTROY
-_R_MISSED_SHOT = cfg.REWARD_MISSED_SHOT
-_R_CLOSER = cfg.REWARD_CLOSER
-_R_AIM_GOOD = cfg.REWARD_AIM_GOOD
-_R_AIM_OKAY = cfg.REWARD_AIM_OKAY
-_AIM_GOOD_THRESH = cfg.AIM_GOOD_THRESHOLD
-_AIM_OKAY_THRESH = cfg.AIM_OKAY_THRESHOLD
-_R_DODGE = cfg.REWARD_DODGE
-_R_UNDER_THREAT = cfg.REWARD_UNDER_THREAT
-_R_MINE_HIT = cfg.REWARD_MINE_HIT
-_R_MINE_SELF = cfg.REWARD_MINE_SELF
-_R_MOVEMENT = cfg.REWARD_MOVEMENT
-_MOVEMENT_DIST_MIN = cfg.MOVEMENT_REWARD_DIST
-_MOVEMENT_DIST_CAP = cfg.MOVEMENT_REWARD_CAP
-
-
-def compute_reward(events: dict, tank_id: int) -> float:
-    """Translate frame events into a scalar reward for *tank_id*."""
-    r = _R_TIMESTEP
-
-    # Kill events (HP reached 0)
-    for shooter, victim in events[EVT_HIT]:
-        if shooter == tank_id:
-            r += _R_HIT_ENEMY
-        if victim == tank_id:
-            r += _R_GOT_HIT
-
-    # Damage events (HP reduced but not dead yet)
-    for shooter, victim, remaining_hp in events[EVT_DAMAGE]:
-        if remaining_hp > 0:
-            if shooter == tank_id:
-                r += _R_DAMAGE
-            if victim == tank_id:
-                r += _R_TOOK_DAMAGE
-
-    # Mine hit events (mines only hurt the enemy, never the owner)
-    for mine_owner, victim in events[EVT_MINE_HIT]:
-        if mine_owner == tank_id:
-            r += _R_MINE_HIT
-
-    for destroyer_id in events[EVT_WALL_DESTROY]:
-        if destroyer_id == tank_id:
-            r += _R_WALL_DESTROY
-
-    for owner_id in events[EVT_BULLET_EXPIRE]:
-        if owner_id == tank_id:
-            r += _R_MISSED_SHOT
-
-    if events["closer"].get(tank_id, False):
-        r += _R_CLOSER
-
-    # Aim reward shaping (using turret angle now)
-    aim_diff = events.get("aim_quality", {}).get(tank_id, 999.0)
-    if aim_diff < _AIM_GOOD_THRESH:
-        r += _R_AIM_GOOD
-    elif aim_diff < _AIM_OKAY_THRESH:
-        r += _R_AIM_OKAY
-
-    # Dodge reward: outcome-based
-    for dodger_id in events.get(EVT_DODGE, []):
-        if dodger_id == tank_id:
-            r += _R_DODGE
-
-    # Per-tick penalty while under threat
-    if tank_id in events.get("under_threat", set()):
-        r += _R_UNDER_THREAT
-
-    # Movement reward: encourage tanks to leave spawn and move around
-    sd = events.get("spawn_dist", {}).get(tank_id, 0.0)
-    if sd >= _MOVEMENT_DIST_MIN:
-        ratio = min((sd - _MOVEMENT_DIST_MIN) / max(_MOVEMENT_DIST_CAP - _MOVEMENT_DIST_MIN, 1), 1.0)
-        r += _R_MOVEMENT * ratio
-
-    return r
 
 
 # ===========================================================================
@@ -123,8 +37,12 @@ def run_episode(gm: GameManager, agents, encoder, renderer: Renderer,
     _learn1 = agents[1].learn if learn else None
     _compute_reward = compute_reward
 
+    _reset_enc = getattr(encoder, 'reset', None)
+
     while not gm.episode_over() and rounds_played < max_rounds:
         gm.new_round()
+        if _reset_enc:
+            _reset_enc()  # clear frame stacking history for new round
         rounds_played += 1
 
         tanks = gm.tanks
@@ -153,12 +71,8 @@ def run_episode(gm: GameManager, agents, encoder, renderer: Renderer,
                 r0 = _compute_reward(events, 0)
                 r1 = _compute_reward(events, 1)
                 round_done = events[EVT_ROUND_OVER]
-                if use_dqn:
-                    _learn0(s0, a0, r0, sn0, done=round_done)
-                    _learn1(s1, a1, r1, sn1, done=round_done)
-                else:
-                    _learn0(s0, a0, r0, sn0)
-                    _learn1(s1, a1, r1, sn1)
+                _learn0(s0, a0, r0, sn0, done=round_done)
+                _learn1(s1, a1, r1, sn1, done=round_done)
                 total_reward += r0 + r1
 
             if not fast:
@@ -198,6 +112,7 @@ def run_parallel_episodes(game_managers: list[GameManager], agent,
     _choose = agent.choose_action
     _learn = agent.learn
     _cr = compute_reward
+    _reset_enc = getattr(encoder, 'reset', None)
 
     # Per-game state
     rounds = [0] * n
@@ -212,6 +127,8 @@ def run_parallel_episodes(game_managers: list[GameManager], agent,
     # Start first round for each
     for i, gm in enumerate(game_managers):
         gm.new_round()
+        if _reset_enc:
+            _reset_enc()
         rounds[i] = 1
 
     while not all(finished):
@@ -245,12 +162,8 @@ def run_parallel_episodes(game_managers: list[GameManager], agent,
             r0 = _cr(events, 0)
             r1 = _cr(events, 1)
             rd = events[EVT_ROUND_OVER]
-            if use_dqn:
-                _learn(s0, a0, r0, sn0, done=rd)
-                _learn(s1, a1, r1, sn1, done=rd)
-            else:
-                _learn(s0, a0, r0, sn0)
-                _learn(s1, a1, r1, sn1)
+            _learn(s0, a0, r0, sn0, done=rd)
+            _learn(s1, a1, r1, sn1, done=rd)
             rewards[i] += r0 + r1
 
             # Round over?
@@ -260,6 +173,8 @@ def run_parallel_episodes(game_managers: list[GameManager], agent,
                     winners[i] = gm.get_episode_winner()
                 else:
                     gm.new_round()
+                    if _reset_enc:
+                        _reset_enc()
                     rounds[i] += 1
 
         # Render first game only
@@ -299,9 +214,22 @@ def main() -> None:
     parser.add_argument("--expert", action="store_true",
                         help="Run rule-based expert agent (no learning, "
                              "immediate smart play for testing)")
+    parser.add_argument("--population", action="store_true",
+                        help="Use Population-Based Training: N agents compete "
+                             "in round-robin tournaments, bottom performers "
+                             "are replaced by mutated clones of top performers")
+    parser.add_argument("--pop-size", type=int, default=None,
+                        help=f"Population size (default {cfg.PBT_POPULATION_SIZE})")
+    parser.add_argument("--generations", type=int, default=40,
+                        help="Number of generations for PBT (default 40)")
     args = parser.parse_args()
 
     model_dir = args.model_dir
+
+    # -- Population-Based Training mode --------------------------------------
+    if args.population:
+        _run_population_mode(args)
+        return
 
     # -- Expert mode (rule-based, no learning) --------------------------------
     if args.expert:
@@ -725,10 +653,7 @@ def _save_model(agent, model_dir: str, model_name: str,
                 model_ext: str, use_dqn: bool,
                 episode: int = 0) -> None:
     path = os.path.join(model_dir, model_name + model_ext)
-    if hasattr(agent, 'save') and 'episode' in agent.save.__code__.co_varnames:
-        agent.save(path, episode=episode)
-    else:
-        agent.save(path)
+    agent.save(path, episode=episode)
     label = "DQN model" if use_dqn else "Shared Q-table"
     print(f"[*] {label} saved to {path} (episode {episode})")
 
@@ -745,6 +670,131 @@ def _print_summary(wins: dict, num_episodes: int) -> None:
     print(f"  Blue win% : {pct0:.1f}%")
     print(f"  Red  win% : {pct1:.1f}%")
     print(f"{'='*50}")
+
+
+# ===========================================================================
+# Population-Based Training mode
+# ===========================================================================
+
+def _run_population_mode(args) -> None:
+    """Run Population-Based Training: a population of DQN agents compete
+    in round-robin tournaments. After each generation, bottom performers
+    are replaced by mutated clones of top performers.
+
+    Usage:  python main.py --population --fast --generations 40
+    """
+    from ai.population import Population
+    from ai.state_encoder_continuous import ContinuousStateEncoder
+
+    try:
+        from ai.dqn_agent import DQNAgent
+    except ImportError as e:
+        print(f"[!] PBT requires PyTorch: {e}")
+        return
+
+    model_dir = args.model_dir
+    pop_size = args.pop_size or cfg.PBT_POPULATION_SIZE
+    num_generations = args.generations
+    fast = args.fast
+
+    encoder = ContinuousStateEncoder()
+    renderer = Renderer() if not fast else Renderer()
+
+    pop = Population(size=pop_size, encoder=encoder)
+
+    # Seed population from existing model if available
+    model_path = os.path.join(model_dir, "dqn_shared.pt")
+    start_ep = 0
+    if os.path.exists(model_path):
+        meta = pop.load_best_into_all(model_path)
+        start_ep = meta.get("episode", 0)
+        pop.cumulative_episode = start_ep
+        print(f"[*] Population seeded from {model_path} "
+              f"(ep={start_ep})")
+
+    param_count = pop.agents[0].network_param_count()
+    print(f"[*] Population-Based Training: "
+          f"{pop_size} agents x {param_count} params each")
+    print(f"    {num_generations} generations, "
+          f"{cfg.PBT_MATCHES_PER_PAIR} matches/pair, "
+          f"elite ratio={cfg.PBT_ELITE_RATIO:.0%}")
+
+    t_start = time.perf_counter()
+    last_rankings = None
+
+    gen = 0
+    try:
+        for gen in range(1, num_generations + 1):
+            t_gen = time.perf_counter()
+            print(f"\n  Generation {gen}/{num_generations} "
+                  f"(cumulative ep ~{pop.cumulative_episode})")
+
+            # Round-robin tournament (all agents learn during matches)
+            rankings = pop.run_tournament(fast=fast, renderer=renderer)
+            last_rankings = rankings
+
+            # Print full fitness table
+            pop.print_fitness(rankings)
+
+            # Evolve: replace bottom with mutated clones of top
+            pop.evolve(rankings)
+
+            # Save best agent every generation
+            best_path = os.path.join(model_dir, "dqn_shared.pt")
+            pop.save_best(best_path, rankings,
+                          episode=pop.cumulative_episode)
+
+            elapsed = time.perf_counter() - t_gen
+            total_elapsed = time.perf_counter() - t_start
+            best_fit = rankings[0]
+            print(f"    gen time: {elapsed:.1f}s  |  "
+                  f"total: {total_elapsed:.0f}s  |  "
+                  f"best=A{best_fit.agent_idx} "
+                  f"Elo={best_fit.elo:.0f} "
+                  f"eps={pop.agents[best_fit.agent_idx].epsilon:.4f}")
+
+    except (KeyboardInterrupt, SystemExit):
+        print(f"\n[!] Interrupted at generation {gen}. Saving...")
+        if last_rankings:
+            best_path = os.path.join(model_dir, "dqn_shared.pt")
+            pop.save_best(best_path, last_rankings,
+                          episode=pop.cumulative_episode)
+        renderer.quit()
+        return
+
+    # Save final population
+    pop.save_all(model_dir, episode=pop.cumulative_episode)
+    best_path = os.path.join(model_dir, "dqn_shared.pt")
+    if last_rankings:
+        pop.save_best(best_path, last_rankings,
+                      episode=pop.cumulative_episode)
+
+    total_elapsed = time.perf_counter() - t_start
+    print(f"\n{'='*60}")
+    print(f"  PBT COMPLETE -- {num_generations} generations in {total_elapsed:.0f}s")
+    print(f"  Total episodes: ~{pop.cumulative_episode}")
+    if last_rankings:
+        best_fit = last_rankings[0]
+        print(f"  Champion: A{best_fit.agent_idx}  "
+              f"Elo={best_fit.elo:.0f}  "
+              f"K/D={best_fit.kd_ratio:.1f}  "
+              f"WR={best_fit.win_rate*100:.0f}%")
+    print(f"  Best agent saved to {best_path}")
+    print(f"{'='*60}")
+
+    # Auto-demo with best agent
+    if last_rankings:
+        best = pop.best_agent(last_rankings)
+        best.epsilon = cfg.EPSILON_MIN
+        agents = [best, best]
+        demo_eps = args.demo_episodes
+        print(f"\n[*] Demo ({demo_eps} episodes) with champion ...")
+        _run_loop(agents, encoder, renderer, demo_eps,
+                  learn=False, fast=False, model_dir=model_dir,
+                  model_name="dqn_shared", model_ext=".pt",
+                  use_dqn=True)
+
+    renderer.quit()
 
 
 if __name__ == "__main__":

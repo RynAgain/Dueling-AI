@@ -50,13 +50,8 @@ _HALF_TO_WIN = cfg.POINTS_TO_WIN // 2
 _math_dist = math.dist
 
 
-def _decode_action(action: int) -> tuple[int, int, int]:
-    """Decode composite action into (move_action, turret_action, fire_action)."""
-    fire_action = action % _NUM_FIRE
-    remaining = action // _NUM_FIRE
-    turret_action = remaining % _NUM_TURRET
-    move_action = remaining // _NUM_TURRET
-    return move_action, turret_action, fire_action
+# Use shared decode from config
+_decode_action = cfg.decode_action
 
 
 class GameManager:
@@ -70,7 +65,8 @@ class GameManager:
         self.current_episode: int = 0
         self.current_round: int = 0
         self.tick_count: int = 0
-        self._prev_dist: float = 0.0  # for shaping reward
+        self._prev_positions: dict[int, tuple[float, float]] = {}  # per-tank previous pos
+        self._prev_dist: float = 0.0  # inter-tank distance (for reference)
         self._wall_count: int | None = None  # curriculum wall count
 
         # Curriculum feature toggles
@@ -112,6 +108,7 @@ class GameManager:
         self.tick_count = 0
         t0, t1 = self.tanks[0], self.tanks[1]
         self._prev_dist = _math_dist((t0.x, t0.y), (t1.x, t1.y))
+        self._prev_positions = {0: (t0.x, t0.y), 1: (t1.x, t1.y)}
         self.spawn_positions_xy = {0: (t0.x, t0.y), 1: (t1.x, t1.y)}
 
     def new_episode(self) -> None:
@@ -332,12 +329,19 @@ class GameManager:
         t0.bullet_count = bc0
         t1.bullet_count = bc1
 
-        # 15. Distance-based shaping -----------------------------------------
+        # 15. Per-tank closer shaping ----------------------------------------
+        #     Each tank gets credit only if *it* moved closer to the opponent.
         d = _math_dist((t0.x, t0.y), (t1.x, t1.y))
-        prev = self._prev_dist
-        closer0 = d < prev
-        closer1 = closer0  # symmetric
+        prev0 = self._prev_positions.get(0, (t0.x, t0.y))
+        prev1 = self._prev_positions.get(1, (t1.x, t1.y))
+        prev_d0 = _math_dist(prev0, (t1.x, t1.y))  # old t0 pos -> current t1
+        prev_d1 = _math_dist(prev1, (t0.x, t0.y))  # old t1 pos -> current t0
+        curr_d0 = _math_dist((t0.x, t0.y), (t1.x, t1.y))
+        curr_d1 = curr_d0  # same inter-tank distance
+        closer0 = curr_d0 < prev_d0  # t0 moved closer to t1
+        closer1 = curr_d1 < prev_d1  # t1 moved closer to t0
         self._prev_dist = d
+        self._prev_positions = {0: (t0.x, t0.y), 1: (t1.x, t1.y)}
 
         # 16. Aim quality (angular difference to enemy using turret angle) ----
         aim_quality = {}
@@ -439,7 +443,7 @@ class GameManager:
                         # Mine triggers on enemy!
                         dead = tank.take_damage(cfg.MINE_DAMAGE)
                         evt_mine_hit.append((mine.owner_id, tank.id))
-                        evt_damage.append((mine.owner_id, tank.id, tank.hp))
+                        evt_damage.append((mine.owner_id, tank.id, tank.hp, False))
                         if dead:
                             evt_hit.append((mine.owner_id, tank.id))
                         triggered = True
@@ -555,7 +559,7 @@ class GameManager:
                 if brect.colliderect(trect):
                     dead = tank.take_damage(1)
                     b.hit_tanks.add(tank.id)  # record hit for dodge tracking
-                    evt_damage.append((owner, tank.id, tank.hp))
+                    evt_damage.append((owner, tank.id, tank.hp, b.has_bounced))
                     if dead:
                         evt_hit.append((owner, tank.id))
                     b.alive = False

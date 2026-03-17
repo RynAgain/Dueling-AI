@@ -32,7 +32,7 @@ Two tanks spawn on opposite sides of an arena filled with breakable walls. They 
 | **Scoring** | Best of 3 points = 1 episode |
 | **Movement** | Hull: forward/backward + rotation (5 deg/tick) |
 | **Turret** | Independent rotation (8 deg/tick), aims separately from hull |
-| **Bullets** | Straight-line travel, ricochet once off arena walls, destroy breakable walls |
+| **Bullets** | Straight-line travel, no ricochet (destroyed on arena wall contact), destroy breakable walls |
 | **Breakable Walls** | 3 HP each, degrade visually, block movement and bullets |
 | **Power-ups** | Speed boost (1.5x), rapid fire (half cooldown), shield (absorb 1 hit) |
 | **Mines** | Drop at current position, arm after 60 ticks, only hurt the enemy |
@@ -117,6 +117,21 @@ python main.py --parallel 1
 python main.py --qtable --fast
 ```
 
+### Population-Based Training (PBT)
+
+```bash
+# Run PBT: 6 agents compete in round-robin, losers replaced by mutated winners
+python main.py --population --fast
+
+# Larger population, more generations
+python main.py --population --fast --pop-size 8 --generations 60
+
+# Seeds from existing model if saved_models/dqn_shared.pt exists
+python main.py --population --fast --generations 20
+```
+
+PBT creates a population of N agents that play round-robin tournaments each generation. After each tournament, the bottom ~67% are replaced by mutated clones of the top ~33%. This produces stronger, more robust strategies than single self-play because agents must beat diverse opponents.
+
 ### Demo / Watching
 
 ```bash
@@ -147,11 +162,16 @@ Epsilon, network weights, and curriculum phase all carry over between runs.
 ## Project Structure
 
 ```
-main.py                          Entry point, training loop, reward computation
+main.py                          Entry point, training loop
 config.py                        All tunable constants and hyperparameters
+requirements.txt                 Python dependencies
 
 ai/
+  base_agent.py                  Agent protocol (interface contract)
   dqn_agent.py                   Double DQN agent (PyTorch, CPU)
+  population.py                  Population-Based Training (generational selection)
+  reward.py                      Reward computation (events -> scalar)
+  expert_agent.py                Rule-based heuristic opponent
   state_encoder_continuous.py    21-float continuous state vector for DQN
   agent.py                       Tabular Double Q-learning agent (fallback)
   state_encoder.py               15-component discretized state for Q-table

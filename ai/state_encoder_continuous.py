@@ -6,27 +6,41 @@
 Each component is normalized to roughly [0, 1] or [-1, 1] range for
 neural network input stability.  The DQN sees continuous values
 instead of bins, so it can learn fine-grained distinctions.
+
+Frame stacking: the encoder stores the last N frames per tank and returns
+them concatenated, so the DQN can perceive velocity, acceleration,
+and opponent behavior patterns.
 """
 from __future__ import annotations
 import math
+from collections import deque
 import config as cfg
 
 # Arena diagonal for distance normalization
 _ARENA_DIAG = math.sqrt(cfg.ARENA_WIDTH ** 2 + cfg.ARENA_HEIGHT ** 2)
 
+# Number of frames to stack (1 = no stacking, 3 = current + 2 history)
+FRAME_STACK_SIZE = 3
+BASE_STATE_DIM = 21  # single-frame vector size
+STACKED_STATE_DIM = BASE_STATE_DIM * FRAME_STACK_SIZE  # 63
+
 
 class ContinuousStateEncoder:
     """Encodes game state into a flat float list for DQN input.
 
-    Output vector (21 floats):
-      0.  rel_angle_hull     -- hull-relative angle to enemy, normalized [-1, 1] via sin
-      1.  rel_angle_hull_cos -- ... via cos (sin+cos avoids wrap-around discontinuity)
+    With frame stacking enabled (FRAME_STACK_SIZE > 1), the output is
+    the concatenation of the last N frame vectors, giving the DQN
+    temporal context to perceive motion and predict trajectories.
+
+    Single-frame vector (21 floats):
+      0.  rel_angle_hull     -- hull-relative angle to enemy, sin
+      1.  rel_angle_hull_cos -- ... cos
       2.  rel_angle_turret   -- turret-relative angle to enemy, sin
       3.  rel_angle_turret_cos -- ... cos
       4.  dist_to_enemy      -- distance, normalized [0, 1]
       5.  enemy_facing_sin   -- enemy's facing toward us, sin
       6.  enemy_facing_cos   -- ... cos
-      7.  wall_front         -- wall raycast front [0, 1] (0=clear, 1=blocked)
+      7.  wall_front         -- wall raycast front [0, 1]
       8.  wall_left          -- wall raycast left
       9.  wall_right         -- wall raycast right
      10.  can_shoot          -- 0 or 1
@@ -36,16 +50,52 @@ class ContinuousStateEncoder:
      14.  active_powerup_rapid  -- 0 or 1
      15.  active_powerup_shield -- 0 or 1
      16.  nearby_powerup     -- 0 or 1
-     17.  mine_threat         -- [0, 1] (0=none, 0.5=far, 1=close)
-     18.  bullet_threat       -- [0, 1] (0=none, 0.5=distant, 1=imminent)
-     19.  bullet_incoming_sin -- sin of angle bullet comes from (0 if none)
-     20.  bullet_incoming_cos -- cos of angle bullet comes from (0 if none)
+     17.  mine_threat         -- [0, 1]
+     18.  bullet_threat       -- [0, 1]
+     19.  bullet_incoming_sin -- sin of incoming bullet angle
+     20.  bullet_incoming_cos -- cos of incoming bullet angle
+
+    Stacked output (63 floats): [frame_t, frame_t-1, frame_t-2]
     """
 
-    STATE_DIM = 21  # total number of floats
+    STATE_DIM = STACKED_STATE_DIM  # 63 (used by DQN to size its input layer)
+
+    def __init__(self):
+        # Per-tank frame history: deque of recent frames
+        self._history: dict[int, deque[list[float]]] = {}
+
+    def _get_history(self, tank_id: int) -> deque[list[float]]:
+        if tank_id not in self._history:
+            # Initialize with zeros (agent has no memory before game starts)
+            zero_frame = [0.0] * BASE_STATE_DIM
+            self._history[tank_id] = deque(
+                [zero_frame[:] for _ in range(FRAME_STACK_SIZE)],
+                maxlen=FRAME_STACK_SIZE)
+        return self._history[tank_id]
+
+    def reset(self) -> None:
+        """Clear frame history (call at round/episode start)."""
+        self._history.clear()
 
     def encode(self, tanks, bullets, walls, arena, tank_id: int,
                powerups=None, mines=None) -> list[float]:
+        """Encode current state and return stacked frame vector."""
+        frame = self._encode_single_frame(tanks, bullets, walls, arena,
+                                           tank_id, powerups, mines)
+        history = self._get_history(tank_id)
+        history.append(frame)
+
+        # Concatenate: most recent first, then older frames
+        stacked: list[float] = []
+        # history is [oldest, ..., newest], we want [newest, ..., oldest]
+        for f in reversed(history):
+            stacked.extend(f)
+        return stacked
+
+    def _encode_single_frame(self, tanks, bullets, walls, arena,
+                              tank_id: int, powerups=None,
+                              mines=None) -> list[float]:
+        """Encode a single frame (21 floats)."""
         me = tanks[tank_id]
         enemy = tanks[1 - tank_id]
 

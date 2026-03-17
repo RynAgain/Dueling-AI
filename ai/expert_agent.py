@@ -111,12 +111,12 @@ class ExpertAgent:
             # Close to enemy -- circle strafe
             move_action = cfg.MOVE_FORWARD if random.random() < 0.6 else cfg.MOVE_ROTATE_LEFT
 
-        # Encode composite action: move * 9 + turret * 3 + fire
-        action = move_action * (cfg.NUM_TURRET_OPTIONS * cfg.NUM_FIRE_OPTIONS) + \
-                 turret_action * cfg.NUM_FIRE_OPTIONS + fire_action
+        # Encode composite action using shared utility
+        action = cfg.encode_action(move_action, turret_action, fire_action)
         return min(action, self.num_actions - 1)
 
-    def learn(self, *args, **kwargs) -> None:
+    def learn(self, state, action: int, reward: float,
+              next_state, done: bool = False) -> None:
         """No-op -- expert doesn't learn."""
         pass
 
@@ -128,7 +128,7 @@ class ExpertAgent:
         """No-op."""
         pass
 
-    def save(self, path: str, **kwargs) -> None:
+    def save(self, path: str, episode: int = 0) -> None:
         """No-op -- nothing to save."""
         pass
 

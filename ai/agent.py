@@ -42,13 +42,6 @@ class QLearningAgent:
             lambda: [0.0] * self.num_actions
         )
 
-        # Legacy alias -- combined view for action selection
-        # (sum of both tables for better estimates)
-        @property
-        def q_table(self_inner):
-            return self_inner.q_table_a
-        self.q_table = self.q_table_a  # default reference for migration/save
-
         # Experience replay
         self.replay_buffer = ReplayBuffer(
             capacity=cfg.REPLAY_CAPACITY,
@@ -75,7 +68,8 @@ class QLearningAgent:
 
     # ------------------------------------------------------------------
     def learn(self, state: tuple, action: int,
-              reward: float, next_state: tuple) -> None:
+              reward: float, next_state: tuple,
+              done: bool = False) -> None:
         """Double Q-learning update + prioritized replay."""
         # Online double-Q update
         td_error = self._double_q_update(state, action, reward, next_state)
@@ -150,7 +144,7 @@ class QLearningAgent:
                            self.epsilon * self.epsilon_decay)
 
     # ------------------------------------------------------------------
-    def save(self, path: str) -> None:
+    def save(self, path: str, episode: int = 0) -> None:
         os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".",
                     exist_ok=True)
         payload = {
@@ -159,6 +153,8 @@ class QLearningAgent:
             "num_actions": self.num_actions,
             "state_size": self._detect_state_size(),
             "replay_buffer": self.replay_buffer.get_data_for_save(),
+            "epsilon": self.epsilon,
+            "episode": episode,
         }
         with open(path, "wb") as f:
             pickle.dump(payload, f)
@@ -170,7 +166,7 @@ class QLearningAgent:
             return len(key)
         return 0
 
-    def load(self, path: str) -> None:
+    def load(self, path: str) -> dict:
         """Load Q-tables with automatic migration for state/action changes.
 
         Handles:
@@ -179,6 +175,9 @@ class QLearningAgent:
         - State tuple padding/truncation
         - Action array resizing
         - Replay buffer restoration
+        - Epsilon and episode restoration
+
+        Returns metadata dict with 'epsilon' and 'episode' keys.
         """
         with open(path, "rb") as f:
             raw = pickle.load(f)
@@ -225,7 +224,10 @@ class QLearningAgent:
             lambda: [0.0] * self.num_actions, migrated_a)
         self.q_table_b = defaultdict(
             lambda: [0.0] * self.num_actions, migrated_b)
-        self.q_table = self.q_table_a  # alias
+
+        # Restore epsilon
+        saved_eps = raw.get("epsilon", self.epsilon) if isinstance(raw, dict) else self.epsilon
+        self.epsilon = saved_eps
 
         # Restore replay buffer
         if replay_data:
@@ -244,6 +246,9 @@ class QLearningAgent:
                 parts.append(f"actions {saved_num_actions}->{current_num_actions}")
             print(f"    [migrate] Q-tables adapted: {', '.join(parts)} "
                   f"(A:{len(migrated_a)}, B:{len(migrated_b)} entries)")
+
+        saved_episode = raw.get("episode", 0) if isinstance(raw, dict) else 0
+        return {"epsilon": saved_eps, "episode": saved_episode}
 
     @staticmethod
     def _migrate_table(data: dict,

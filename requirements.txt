@@ -1,0 +1,4 @@
+pygame>=2.0
+matplotlib>=3.5
+# PyTorch (CPU-only) -- required for DQN mode, optional for Q-table mode
+# Install separately:  pip install torch --index-url https://download.pytorch.org/whl/cpu
