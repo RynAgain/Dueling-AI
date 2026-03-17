@@ -44,15 +44,17 @@ MINE_LIFETIME = 900   # despawn after 15 seconds
 MINE_DAMAGE = 1
 
 # Scoring
-POINTS_TO_WIN = 10
+POINTS_TO_WIN = 3
 ROUND_TIMEOUT = 1000  # ticks (~17s at 60 FPS -- faster resolution)
-MAX_ROUNDS_PER_EPISODE = 20  # safety cap to prevent infinite episodes
+SHRINK_START_RATIO = 0.6  # start pushing tanks toward center at 60% of timeout
+SHRINK_FORCE = 0.3        # pixels/tick push toward center during shrink phase
+MAX_ROUNDS_PER_EPISODE = 10  # safety cap to prevent infinite episodes
 
 # Q-Learning hyperparameters
 ALPHA = 0.1
 GAMMA = 0.95
 EPSILON_START = 1.0
-EPSILON_DECAY = 0.998
+EPSILON_DECAY = 0.998         # for Q-table (overridden for DQN below)
 EPSILON_MIN = 0.02
 
 # Action space: 5 movement x 3 turret x 3 fire = 45
@@ -71,7 +73,10 @@ REWARD_MISSED_SHOT = -0.2
 REWARD_TIMESTEP = -0.01
 REWARD_CLOSER = 0.05
 REWARD_MINE_HIT = 5.0       # mine you placed hit the enemy
-REWARD_MINE_SELF = -5.0     # you stepped on a mine
+REWARD_MINE_SELF = -5.0     # (legacy -- mines no longer hurt owner)
+REWARD_MOVEMENT = 0.02      # per-tick bonus when tank has moved from spawn
+MOVEMENT_REWARD_DIST = 50   # minimum distance from spawn to earn movement reward
+MOVEMENT_REWARD_CAP = 200   # distance beyond which movement reward doesn't increase
 
 # Aim reward shaping
 REWARD_AIM_GOOD = 0.3
@@ -103,13 +108,28 @@ REPLAY_MIN_SIZE = 500        # don't replay until buffer has this many
 REPLAY_EPISODE_BURST = 128   # large replay burst at end of each episode
 PER_ALPHA = 0.6              # prioritisation exponent (0=uniform, 1=full priority)
 
-# Curriculum learning
-CURRICULUM_PHASE_1_END = 300  # episodes 0-300: no walls
-CURRICULUM_PHASE_2_END = 800  # episodes 301-800: few walls (4)
-# episodes 801+: full walls (8-12)
+# DQN hyperparameters (used when --dqn flag is passed)
+DQN_STATE_DIM = 21           # continuous state vector size (from state_encoder_continuous)
+DQN_LR = 3e-3               # Adam learning rate (aggressive -- small network trains fast)
+DQN_BATCH_SIZE = 128         # mini-batch size for DQN training
+DQN_TARGET_UPDATE = 300      # steps between target network updates (faster sync)
+DQN_MIN_REPLAY = 100         # min buffer size before training starts (start learning fast)
+DQN_EPSILON_DECAY = 0.995    # faster decay for DQN (reaches 0.1 at ~460 eps)
+DQN_TRAIN_FREQ = 4           # train every N steps (skip some for speed)
+DQN_GRAD_STEPS = 2           # gradient updates per train step
+
+# Expert opponent mixing (during DQN training)
+EXPERT_MIX_RATIO = 0.25     # 25% of training episodes use expert as opponent
+
+# Curriculum learning (5 phases -- gradually introduce features)
+CURRICULUM_PHASE_1_END = 200   # episodes 1-200:   no walls, no power-ups, no mines
+CURRICULUM_PHASE_2_END = 500   # episodes 201-500: few walls (4), no power-ups, no mines
+CURRICULUM_PHASE_3_END = 800   # episodes 501-800: full walls, power-ups enabled
+CURRICULUM_PHASE_4_END = 1200  # episodes 801-1200: full walls, power-ups, mines enabled
+# episodes 1201+: everything enabled (full game)
 
 # Rendering
-FPS = 60
+FPS = 600
 SCREEN_WIDTH = ARENA_WIDTH
 SCREEN_HEIGHT = ARENA_HEIGHT + HUD_HEIGHT
 

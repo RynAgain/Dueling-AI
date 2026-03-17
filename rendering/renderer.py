@@ -247,11 +247,15 @@ class Renderer:
         if stats:
             ep = stats.get("ep", 0)
             if ep <= cfg.CURRICULUM_PHASE_1_END:
-                phase_str = "P1:NoWall"
+                phase_str = "P1:Shoot"
             elif ep <= cfg.CURRICULUM_PHASE_2_END:
-                phase_str = "P2:FewWall"
+                phase_str = "P2:Walls"
+            elif ep <= cfg.CURRICULUM_PHASE_3_END:
+                phase_str = "P3:PwrUp"
+            elif ep <= cfg.CURRICULUM_PHASE_4_END:
+                phase_str = "P4:Mines"
             else:
-                phase_str = "P3:Full"
+                phase_str = "P5:Full"
 
         # Tank HP info for HUD
         t0_hp = gm.tanks[0].hp if gm.tanks else 0

@@ -43,6 +43,8 @@ _TANK_HH = cfg.TANK_HEIGHT / 2
 _TANK_W = cfg.TANK_WIDTH
 _TANK_H = cfg.TANK_HEIGHT
 _ROUND_TIMEOUT = cfg.ROUND_TIMEOUT
+_SHRINK_START = int(cfg.ROUND_TIMEOUT * cfg.SHRINK_START_RATIO)
+_SHRINK_FORCE = cfg.SHRINK_FORCE
 _POINTS_TO_WIN = cfg.POINTS_TO_WIN
 _HALF_TO_WIN = cfg.POINTS_TO_WIN // 2
 _math_dist = math.dist
@@ -71,6 +73,10 @@ class GameManager:
         self._prev_dist: float = 0.0  # for shaping reward
         self._wall_count: int | None = None  # curriculum wall count
 
+        # Curriculum feature toggles
+        self.powerups_enabled: bool = True
+        self.mines_enabled: bool = True
+
         # Power-ups
         self.powerups: list[PowerUp] = []
         self._powerup_spawn_timer: int = 0
@@ -78,6 +84,9 @@ class GameManager:
 
         # Mines
         self.mines: list[Mine] = []
+
+        # Spawn positions for movement reward
+        self.spawn_positions_xy: dict[int, tuple[float, float]] = {}
 
         self._reset_tanks_and_arena()
 
@@ -103,6 +112,7 @@ class GameManager:
         self.tick_count = 0
         t0, t1 = self.tanks[0], self.tanks[1]
         self._prev_dist = _math_dist((t0.x, t0.y), (t1.x, t1.y))
+        self.spawn_positions_xy = {0: (t0.x, t0.y), 1: (t1.x, t1.y)}
 
     def new_episode(self) -> None:
         self.current_episode += 1
@@ -216,18 +226,19 @@ class GameManager:
 
         # 5. Spawn bullets or mines (fire action) ----------------------------
         bullets = self.bullets
+        mines_ok = self.mines_enabled
         if fire0 == _FIRE_SHOOT:
             b = t0.shoot()
             if b is not None:
                 bullets.append(b)
-        elif fire0 == _FIRE_MINE:
+        elif fire0 == _FIRE_MINE and mines_ok:
             self._try_lay_mine(t0)
 
         if fire1 == _FIRE_SHOOT:
             b = t1.shoot()
             if b is not None:
                 bullets.append(b)
-        elif fire1 == _FIRE_MINE:
+        elif fire1 == _FIRE_MINE and mines_ok:
             self._try_lay_mine(t1)
 
         # 6. Move bullets ----------------------------------------------------
@@ -253,11 +264,13 @@ class GameManager:
         # 9. Update mines ----------------------------------------------------
         self._update_mines(tanks, evt_mine_hit, evt_damage, evt_hit)
 
-        # 10. Power-up spawning ----------------------------------------------
-        self._update_powerup_spawning(tanks)
+        # 10. Power-up spawning (gated by curriculum) ------------------------
+        if self.powerups_enabled:
+            self._update_powerup_spawning(tanks)
 
         # 11. Power-up pickup ------------------------------------------------
-        self._check_powerup_pickup(tanks)
+        if self.powerups_enabled:
+            self._check_powerup_pickup(tanks)
 
         # 12. Despawn old power-ups ------------------------------------------
         for pu in self.powerups:
@@ -334,21 +347,46 @@ class GameManager:
             diff = abs(((angle_to_enemy - me.turret_angle) + 180) % 360 - 180)
             aim_quality[tid] = diff
 
-        # 17. Scoring / round-end check --------------------------------------
+        # 17. Shrink phase -- push tanks toward center after 60% of timeout --
+        self.tick_count += 1
+        if self.tick_count >= _SHRINK_START:
+            cx = arena.width / 2
+            cy = arena.height / 2
+            # Push strength increases linearly as timeout approaches
+            progress = (self.tick_count - _SHRINK_START) / max(_ROUND_TIMEOUT - _SHRINK_START, 1)
+            force = _SHRINK_FORCE * (1.0 + progress * 2.0)  # ramps up from 0.3 to 0.9
+            for tank in tanks:
+                dx = cx - tank.x
+                dy = cy - tank.y
+                dist_to_center = math.sqrt(dx * dx + dy * dy)
+                if dist_to_center > 10:
+                    tank.x += (dx / dist_to_center) * force
+                    tank.y += (dy / dist_to_center) * force
+
+        # 18. Scoring / round-end check --------------------------------------
         round_over = False
         round_winner = None
         # Check if any tank is dead (HP <= 0)
         for tank in tanks:
             if not tank.is_alive:
                 round_over = True
-                # The killer is the other tank
                 round_winner = 1 - tank.id
                 self.scores[round_winner] = self.scores.get(round_winner, 0) + 1
                 break
 
-        self.tick_count += 1
         if not round_over and self.tick_count >= _ROUND_TIMEOUT:
             round_over = True
+            # Timeout: award point to tank with more HP remaining
+            if t0.hp != t1.hp:
+                round_winner = 0 if t0.hp > t1.hp else 1
+                self.scores[round_winner] = self.scores.get(round_winner, 0) + 1
+            # If HP is tied, no point awarded (true draw for this round)
+
+        # 18. Spawn distance (how far each tank is from its spawn point) -----
+        spawn_dist = {}
+        for tid, tank in [(0, t0), (1, t1)]:
+            sx, sy = self.spawn_positions_xy.get(tid, (tank.x, tank.y))
+            spawn_dist[tid] = _math_dist((tank.x, tank.y), (sx, sy))
 
         return {
             EVT_HIT: evt_hit,
@@ -361,6 +399,7 @@ class GameManager:
             EVT_DODGE: evt_dodge,
             "under_threat": under_threat,
             "closer": {0: closer0, 1: closer1},
+            "spawn_dist": spawn_dist,
             "aim_quality": aim_quality,
         }
 
