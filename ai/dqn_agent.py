@@ -20,14 +20,15 @@ import config as cfg
 # ===========================================================================
 
 class QNetwork(nn.Module):
-    """Small MLP: state_dim -> 128 -> 128 -> 64 -> num_actions."""
+    """MLP: state_dim -> h1 -> h2 -> h3 -> num_actions."""
 
-    def __init__(self, state_dim: int, num_actions: int):
+    def __init__(self, state_dim: int, num_actions: int,
+                 h1: int = 256, h2: int = 256, h3: int = 128):
         super().__init__()
-        self.fc1 = nn.Linear(state_dim, 128)
-        self.fc2 = nn.Linear(128, 128)
-        self.fc3 = nn.Linear(128, 64)
-        self.out = nn.Linear(64, num_actions)
+        self.fc1 = nn.Linear(state_dim, h1)
+        self.fc2 = nn.Linear(h1, h2)
+        self.fc3 = nn.Linear(h2, h3)
+        self.out = nn.Linear(h3, num_actions)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = F.relu(self.fc1(x))
@@ -37,24 +38,136 @@ class QNetwork(nn.Module):
 
 
 # ===========================================================================
-# Replay buffer (simple, numpy-free for portability)
+# Prioritized Experience Replay with Sum-Tree (O(log n) sampling)
 # ===========================================================================
 
-class DQNReplayBuffer:
-    """Simple fixed-size replay buffer storing float-vector transitions."""
+class _SumTree:
+    """Binary tree where each leaf stores a priority and parent nodes store
+    the sum of their children.  Enables O(log n) proportional sampling.
+    """
 
-    def __init__(self, capacity: int = 50000):
-        self.buffer: deque = deque(maxlen=capacity)
+    def __init__(self, capacity: int):
+        self.capacity = capacity
+        self.tree = [0.0] * (2 * capacity)  # index 0 unused for 1-based
+        self.data = [None] * capacity
+        self.write_pos = 0
+        self.size = 0
+
+    @property
+    def total(self) -> float:
+        return self.tree[1]
+
+    def _propagate(self, idx: int) -> None:
+        parent = idx >> 1
+        while parent >= 1:
+            self.tree[parent] = self.tree[parent << 1] + self.tree[(parent << 1) + 1]
+            parent >>= 1
+
+    def update(self, leaf_idx: int, priority: float) -> None:
+        self.tree[leaf_idx] = priority
+        self._propagate(leaf_idx)
+
+    def add(self, priority: float, data) -> None:
+        leaf_idx = self.write_pos + self.capacity
+        self.data[self.write_pos] = data
+        self.update(leaf_idx, priority)
+        self.write_pos = (self.write_pos + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
+
+    def get(self, value: float) -> tuple[int, float, object]:
+        """Walk down the tree to find the leaf for a sampled value.
+        Returns (leaf_index, priority, data).
+        """
+        idx = 1
+        while idx < self.capacity:
+            left = idx << 1
+            right = left + 1
+            if value <= self.tree[left]:
+                idx = left
+            else:
+                value -= self.tree[left]
+                idx = right
+        data_idx = idx - self.capacity
+        return idx, self.tree[idx], self.data[data_idx]
+
+
+class DQNReplayBuffer:
+    """Prioritized Experience Replay buffer using a sum-tree.
+
+    High TD-error transitions are sampled more frequently.
+    Importance sampling weights correct for the non-uniform sampling bias.
+    """
+
+    def __init__(self, capacity: int = 50000, alpha: float = 0.6, beta: float = 0.4):
+        self.capacity = capacity
+        self.alpha = alpha     # priority exponent (0=uniform, 1=full priority)
+        self.beta = beta       # IS weight exponent (annealed toward 1.0)
+        self.beta_increment = 0.001  # per-sample beta annealing
+        self._tree = _SumTree(capacity)
+        self._max_priority = 1.0
+        self._epsilon = 1e-5  # small constant to avoid zero priority
 
     def push(self, state: list[float], action: int,
              reward: float, next_state: list[float], done: bool) -> None:
-        self.buffer.append((state, action, reward, next_state, done))
+        """Add transition with max priority (will be replayed soon)."""
+        priority = self._max_priority ** self.alpha
+        self._tree.add(priority, (state, action, reward, next_state, done))
 
-    def sample(self, batch_size: int) -> list:
-        return random.sample(self.buffer, min(batch_size, len(self.buffer)))
+    def sample(self, batch_size: int) -> tuple[list, list[int], list[float]]:
+        """Sample a prioritized batch.
+
+        Returns (batch_data, leaf_indices, is_weights).
+        is_weights are importance-sampling corrections.
+        """
+        n = self._tree.size
+        if n == 0:
+            return [], [], []
+        batch_size = min(batch_size, n)
+
+        batch = []
+        indices = []
+        priorities = []
+        total = self._tree.total
+        segment = total / batch_size
+
+        # Anneal beta toward 1.0
+        self.beta = min(1.0, self.beta + self.beta_increment)
+
+        for i in range(batch_size):
+            low = segment * i
+            high = segment * (i + 1)
+            value = random.uniform(low, high)
+            leaf_idx, priority, data = self._tree.get(value)
+            if data is None:
+                continue
+            batch.append(data)
+            indices.append(leaf_idx)
+            priorities.append(priority)
+
+        if not batch:
+            return [], [], []
+
+        # Importance sampling weights
+        total_p = total
+        min_p = min(priorities) / total_p
+        max_w = (min_p * n) ** (-self.beta)
+        weights = []
+        for p in priorities:
+            prob = p / total_p
+            w = (prob * n) ** (-self.beta) / max_w
+            weights.append(w)
+
+        return batch, indices, weights
+
+    def update_priorities(self, indices: list[int], td_errors: list[float]) -> None:
+        """Update priorities based on TD-errors from training."""
+        for idx, td in zip(indices, td_errors):
+            priority = (abs(td) + self._epsilon) ** self.alpha
+            self._tree.update(idx, priority)
+            self._max_priority = max(self._max_priority, abs(td) + self._epsilon)
 
     def __len__(self) -> int:
-        return len(self.buffer)
+        return self._tree.size
 
 
 # ===========================================================================
@@ -133,10 +246,15 @@ class DQNAgent:
         self._train_freq = getattr(cfg, 'DQN_TRAIN_FREQ', 4)
         self._grad_steps = getattr(cfg, 'DQN_GRAD_STEPS', 2)
 
-        # Networks
+        # Networks (configurable hidden layer sizes)
+        self._h1 = getattr(cfg, 'DQN_HIDDEN_1', 256)
+        self._h2 = getattr(cfg, 'DQN_HIDDEN_2', 256)
+        self._h3 = getattr(cfg, 'DQN_HIDDEN_3', 128)
         self.device = torch.device("cpu")
-        self.policy_net = QNetwork(self.state_dim, self.num_actions).to(self.device)
-        self.target_net = QNetwork(self.state_dim, self.num_actions).to(self.device)
+        self.policy_net = QNetwork(self.state_dim, self.num_actions,
+                                   self._h1, self._h2, self._h3).to(self.device)
+        self.target_net = QNetwork(self.state_dim, self.num_actions,
+                                   self._h1, self._h2, self._h3).to(self.device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.target_net.eval()
 
@@ -180,15 +298,15 @@ class DQNAgent:
 
         # Multiple gradient steps per train call
         for _ in range(self._grad_steps):
-            batch = self.replay_buffer.sample(self.batch_size)
-            self._train_batch(batch)
+            self._train_per_batch()
 
         # Update target network periodically
         if self._step_count % self.target_update_freq == 0:
             self.target_net.load_state_dict(self.policy_net.state_dict())
 
-    def _train_batch(self, batch: list) -> None:
-        """One gradient step on a batch of transitions."""
+    def _train_per_batch(self) -> None:
+        """Sample a prioritized batch, train, update priorities."""
+        batch, indices, is_weights = self.replay_buffer.sample(self.batch_size)
         if not batch:
             return
 
@@ -202,6 +320,8 @@ class DQNAgent:
                                    dtype=torch.float32, device=self.device)
         dones = torch.tensor([t[4] for t in batch],
                              dtype=torch.float32, device=self.device)
+        weights = torch.tensor(is_weights,
+                               dtype=torch.float32, device=self.device)
 
         # Current Q-values for chosen actions
         q_current = self.policy_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
@@ -213,14 +333,21 @@ class DQNAgent:
                 1, best_actions.unsqueeze(1)).squeeze(1)
             q_target = rewards + self.gamma * q_next * (1 - dones)
 
-        # Huber loss (smooth L1) -- less sensitive to outliers than MSE
-        loss = F.smooth_l1_loss(q_current, q_target)
+        # Per-element TD error (for priority update)
+        td_errors = (q_current - q_target).detach()
+
+        # Weighted Huber loss (IS weights correct for non-uniform sampling)
+        element_loss = F.smooth_l1_loss(q_current, q_target, reduction='none')
+        loss = (element_loss * weights).mean()
 
         self.optimizer.zero_grad()
         loss.backward()
-        # Gradient clipping for stability
         torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
         self.optimizer.step()
+
+        # Update priorities in the sum-tree
+        self.replay_buffer.update_priorities(
+            indices, td_errors.abs().tolist())
 
     # ------------------------------------------------------------------
     def episode_end_replay(self) -> None:
@@ -230,8 +357,7 @@ class DQNAgent:
         burst = getattr(cfg, 'REPLAY_EPISODE_BURST', 128)
         steps = max(burst // self.batch_size, 1)
         for _ in range(steps):
-            batch = self.replay_buffer.sample(self.batch_size)
-            self._train_batch(batch)
+            self._train_per_batch()
         # Sync target network after burst
         self.target_net.load_state_dict(self.policy_net.state_dict())
 
